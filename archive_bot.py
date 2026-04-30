@@ -1,7 +1,10 @@
 """
-AI Archive Bot v3 — Accurate question-level extraction
-Key improvement: maps each question number to its exact page,
-so "first 10 MCQ" always gets exactly the right pages.
+AI Archive Bot v4 — Handles scanned PDFs + better section detection
+Key fixes:
+1. Scanned PDF fallback: estimates question counts from page counts
+2. Broader question number regex catches more formats  
+3. Smarter section detection: skips cover/instruction pages
+4. Page-based extraction always works even when text extraction fails
 """
 
 import os, re, json, logging, requests, tempfile
@@ -17,151 +20,196 @@ from telegram.ext import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
-GEMINI_API_KEY   = os.environ.get("GEMINI_API_KEY", "")
-GOOGLE_SHEET_ID  = os.environ.get("GOOGLE_SHEET_ID", "")
-DRIVE_FOLDER_ID  = os.environ.get("DRIVE_FOLDER_ID", "")
-ALLOWED_USER_ID  = int(os.environ.get("ALLOWED_USER_ID", "0"))
+TELEGRAM_TOKEN  = os.environ["TELEGRAM_TOKEN"]
+GEMINI_API_KEY  = os.environ.get("GEMINI_API_KEY", "")
+GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "")
+DRIVE_FOLDER_ID = os.environ.get("DRIVE_FOLDER_ID", "")
+ALLOWED_USER_ID = int(os.environ.get("ALLOWED_USER_ID", "0"))
 
-KNOWN_USERS = {
-    # add your colleagues: "telegramusername": "Display Name"
-}
+KNOWN_USERS = {}  # "telegramusername": "Display Name"
 
 
-# ─── IMPROVED SECTION DETECTOR ──────────────────────────────────────
-def detect_sections_v2(pdf_path: str) -> dict:
+# ─── SECTION DETECTION ───────────────────────────────────────────────
+MCQ_MARKERS = [
+    "section a", "part a", "multiple choice", "booklet a",
+    "questions 1 to", "choose the correct", "shade the correct",
+    "circle the correct", "for each question",
+    "each question carries 1 mark", "each carries 1 mark",
+]
+OE_MARKERS = [
+    "section b", "part b", "open-ended", "open ended", "booklet b",
+    "structured question", "short answer",
+    "write your answer in the space",
+    "each question carries 2", "each question carries 3",
+    "each question carries 4", "carries 2 marks", "carries 3 marks",
+]
+ANS_MARKERS = [
+    "answer key", "marking scheme", "suggested answer",
+    "marking guide", "answers to", "model answer",
+]
+SKIP_MARKERS = [  # pages to ignore (cover, instructions, blank)
+    "do not open this booklet",
+    "name:", "class:", "register",
+    "instructions to candidates",
+    "write your name",
+    "this paper consists of",
+    "end of paper",
+    "— end —", "* end *",
+    "blank page", "this page is intentionally",
+]
+
+# Typical SG exam questions per page (for scanned PDF estimation)
+MCQ_PER_PAGE = {(1,3): 8, (4,6): 6, (7,20): 5}   # pages: q_per_page
+OE_PER_PAGE  = {(1,4): 4, (5,10): 3, (11,30): 2}
+
+
+def estimate_q_count(n_pages: int, section: str) -> int:
+    """Estimate question count from page count when PDF is scanned."""
+    if n_pages == 0:
+        return 0
+    if section == "MCQ":
+        for (lo, hi), ppg in MCQ_PER_PAGE.items():
+            if lo <= n_pages <= hi:
+                return n_pages * ppg
+        return n_pages * 5
+    else:
+        for (lo, hi), ppg in OE_PER_PAGE.items():
+            if lo <= n_pages <= hi:
+                return n_pages * ppg
+        return n_pages * 2
+
+
+def detect_sections(pdf_path: str) -> dict:
     """
-    Detects sections by finding question numbers (1., 2., Q1, etc.)
-    on each page, building an exact question→page map.
-    Much more accurate than keyword-only detection.
+    Two-pass detection:
+    Pass 1: Find section boundaries from headers
+    Pass 2: Find question numbers within each section
+    Falls back to page estimates if PDF is scanned (no extractable text)
     """
     reader = PdfReader(pdf_path)
     total_pages = len(reader.pages)
 
-    mcq_q_map = {}   # {question_number: page_index}
-    oe_q_map  = {}
-    answer_pages = []
+    mcq_pages, oe_pages, ans_pages = [], [], []
+    mcq_q_map, oe_q_map = {}, {}
     current_section = None
+    text_found = False  # track if any text was extractable
 
-    # Singapore-specific section header patterns
-    MCQ_MARKERS = [
-        "section a", "part a", "multiple choice",
-        "questions 1 to", "choose the correct answer",
-        "shade the correct", "circle the correct",
-        "for each question", "each question carries 1 mark",
-    ]
-    OE_MARKERS = [
-        "section b", "part b", "open-ended", "open ended",
-        "structured question", "short answer",
-        "write your answer in the space",
-        "each question carries 2 mark",
-        "each question carries 3 mark",
-        "each question carries 4 mark",
-    ]
-    ANS_MARKERS = [
-        "answers", "answer key", "marking scheme",
-        "suggested answer", "marking guide",
-        "do not open", "end of paper",
-        "— end —", "* end *",
+    # Broader question number patterns
+    Q_PATTERNS = [
+        r'(?:^|\n)\s{0,8}(\d{1,2})[\.\)\]]\s',       # 1. 1) 1]
+        r'(?:^|\n)\s{0,8}(\d{1,2})\t',                # 1\t
+        r'(?:^|\n)\s{0,8}(\d{1,2})\s{2,}',            # 1   (2+ spaces)
+        r'(?:^|\n)\s{0,8}[Qq](?:uestion)?\s*\.?\s*(\d{1,2})', # Q1 Question 1
+        r'(?:^|\n)\s{0,8}\[(\d{1,2})\]',              # [1]
+        r'(?:^|\n)\s{0,8}(\d{1,2})\s*\n\s*[A-Z\(]',  # number then capital
     ]
 
     with pdfplumber.open(pdf_path) as pdf:
         for page_idx, page in enumerate(pdf.pages):
             text = page.extract_text() or ""
-            text_lower = text.lower()
+            text_lower = text.lower().strip()
 
-            # Check for answer/end pages first
+            if len(text_lower) > 20:
+                text_found = True
+
+            # Skip cover/instruction pages
+            if any(kw in text_lower for kw in SKIP_MARKERS) and page_idx < 3:
+                continue
+
+            # Answer pages
             if any(kw in text_lower for kw in ANS_MARKERS):
-                if "marking" in text_lower or "answer" in text_lower:
-                    answer_pages.append(page_idx)
-                    current_section = "ANSWERS"
-                    continue
+                ans_pages.append(page_idx)
+                current_section = "ANS"
+                continue
 
-            # Detect section transitions
+            if current_section == "ANS":
+                ans_pages.append(page_idx)
+                continue
+
+            # Section transitions
             if any(kw in text_lower for kw in MCQ_MARKERS):
                 current_section = "MCQ"
             elif any(kw in text_lower for kw in OE_MARKERS):
                 current_section = "OE"
 
-            if current_section == "ANSWERS":
-                answer_pages.append(page_idx)
-                continue
+            # Assign page to section
+            if current_section == "MCQ":
+                mcq_pages.append(page_idx)
+            elif current_section == "OE":
+                oe_pages.append(page_idx)
+            elif current_section is None and page_idx > 0:
+                # Unknown section after cover — assume MCQ for primary papers
+                mcq_pages.append(page_idx)
 
-            # Extract question numbers from this page
-            # Patterns: "1.", "1)", "Q1.", "Q.1", "(1)" at line start
-            patterns = [
-                r'(?:^|\n)\s{0,4}(\d{1,2})\.\s',       # "1. "
-                r'(?:^|\n)\s{0,4}(\d{1,2})\)\s',       # "1) "
-                r'(?:^|\n)\s{0,4}[Qq]\.?\s*(\d{1,2})', # "Q1" or "Q.1"
-                r'(?:^|\n)\s{0,4}\((\d{1,2})\)\s',     # "(1) "
-            ]
-
-            found_nums = set()
-            for pat in patterns:
-                matches = re.findall(pat, text, re.MULTILINE)
-                found_nums.update(int(n) for n in matches if 1 <= int(n) <= 60)
-
-            if not found_nums:
-                continue
+            # Extract question numbers
+            found = set()
+            for pat in Q_PATTERNS:
+                for m in re.findall(pat, text, re.MULTILINE):
+                    if m.isdigit() and 1 <= int(m) <= 60:
+                        found.add(int(m))
 
             if current_section == "MCQ":
-                for q in found_nums:
-                    if q not in mcq_q_map:  # first page wins
+                for q in found:
+                    if q not in mcq_q_map:
                         mcq_q_map[q] = page_idx
             elif current_section == "OE":
-                for q in found_nums:
+                for q in found:
                     if q not in oe_q_map:
                         oe_q_map[q] = page_idx
 
-    # If section detection completely failed, try Gemini
-    if not mcq_q_map and not oe_q_map:
+    # Deduplicate and sort
+    mcq_pages = sorted(set(mcq_pages))
+    oe_pages  = sorted(set(oe_pages))
+    ans_pages = sorted(set(ans_pages))
+
+    # Determine question counts
+    if mcq_q_map:
+        mcq_total = max(mcq_q_map.keys())
+    else:
+        # Scanned PDF — estimate from page count
+        mcq_total = estimate_q_count(len(mcq_pages), "MCQ")
+        logger.info(f"Scanned PDF: estimating {mcq_total} MCQ from {len(mcq_pages)} pages")
+
+    if oe_q_map:
+        oe_total = max(oe_q_map.keys())
+    else:
+        oe_total = estimate_q_count(len(oe_pages), "OE")
+        logger.info(f"Scanned PDF: estimating {oe_total} OE from {len(oe_pages)} pages")
+
+    # If section detection completely failed, use Gemini
+    if not mcq_pages and not oe_pages and not ans_pages:
         return ai_detect_sections(pdf_path, total_pages)
-
-    mcq_pages = sorted(set(mcq_q_map.values()))
-    oe_pages  = sorted(set(oe_q_map.values()))
-
-    logger.info(f"MCQ map: {mcq_q_map}")
-    logger.info(f"OE map: {oe_q_map}")
 
     return {
         "MCQ": mcq_pages,
         "OE":  oe_pages,
-        "Answers": sorted(set(answer_pages)),
+        "Answers": ans_pages,
         "total": total_pages,
         "mcq_q_map": mcq_q_map,
         "oe_q_map":  oe_q_map,
-        "mcq_total": max(mcq_q_map.keys()) if mcq_q_map else 0,
-        "oe_total":  max(oe_q_map.keys())  if oe_q_map  else 0,
+        "mcq_total": mcq_total,
+        "oe_total":  oe_total,
+        "is_scanned": not text_found,
     }
 
 
-def get_pages_for_q_range(q_map: dict, q_from: int, q_to: int) -> list:
-    """
-    Returns the exact pages needed to cover questions q_from..q_to.
-    This ensures 'first 10 MCQ' always gets exactly those questions.
-    """
-    pages = set()
-    for q_num, page_idx in q_map.items():
-        if q_from <= q_num <= q_to:
-            pages.add(page_idx)
-    return sorted(pages)
-
-
 def ai_detect_sections(pdf_path: str, total_pages: int) -> dict:
-    """Fallback: use Gemini when text extraction fails (scanned PDFs)."""
+    """Gemini fallback for completely unreadable PDFs."""
     reader = PdfReader(pdf_path)
     sample = ""
     for i in list(range(min(4, total_pages))) + list(range(max(0, total_pages-3), total_pages)):
-        sample += f"\n--- Page {i+1} ---\n{(reader.pages[i].extract_text() or '')[:600]}"
+        sample += f"\n--- Page {i+1} ---\n{(reader.pages[i].extract_text() or '')[:400]}"
 
-    prompt = f"""Singapore primary school exam paper, {total_pages} pages.
-Sample text:
+    prompt = f"""Singapore primary exam paper, {total_pages} pages total.
+Sample text from first and last pages:
 {sample}
 
-Identify sections. Return ONLY JSON:
-{{"MCQ": [0,1,2,3,4], "OE": [5,6,7,8,9,10,11], "Answers": [12,13,14,15],
+Identify which pages belong to MCQ, Open-Ended questions, and Answers sections.
+Typical structure: cover (1-2 pages), MCQ section (3-6 pages), OE section (5-12 pages), answers (2-5 pages).
+Return ONLY JSON (0-indexed page numbers):
+{{"MCQ": [2,3,4,5], "OE": [6,7,8,9,10,11], "Answers": [12,13,14],
  "mcq_total": 30, "oe_total": 20, "total": {total_pages},
- "mcq_q_map": {{}}, "oe_q_map": {{}}}}"""
+ "mcq_q_map": {{}}, "oe_q_map": {{}}, "is_scanned": true}}"""
 
     try:
         r = requests.post(
@@ -177,14 +225,40 @@ Identify sections. Return ONLY JSON:
     except Exception as e:
         logger.error(f"Gemini fallback failed: {e}")
 
-    # Last resort: rough split
-    a = int(total_pages * 0.40)
-    b = int(total_pages * 0.85)
+    # Hard fallback: rough split
+    cover = 2
+    a = cover + int((total_pages - cover) * 0.30)
+    b = cover + int((total_pages - cover) * 0.80)
     return {
-        "MCQ": list(range(0, a)), "OE": list(range(a, b)),
-        "Answers": list(range(b, total_pages)), "total": total_pages,
-        "mcq_q_map": {}, "oe_q_map": {}, "mcq_total": 0, "oe_total": 0,
+        "MCQ": list(range(cover, a)),
+        "OE":  list(range(a, b)),
+        "Answers": list(range(b, total_pages)),
+        "total": total_pages,
+        "mcq_q_map": {}, "oe_q_map": {},
+        "mcq_total": estimate_q_count(a - cover, "MCQ"),
+        "oe_total":  estimate_q_count(b - a, "OE"),
+        "is_scanned": True,
     }
+
+
+def get_pages_for_q_range(q_map: dict, all_pages: list, q_from: int, q_to: int, total_q: int) -> list:
+    """
+    Get pages for a question range.
+    Uses exact map if available (text PDF), otherwise estimates from page count (scanned PDF).
+    """
+    if q_map:
+        # Exact lookup
+        pages = sorted(set(p for q, p in q_map.items() if q_from <= q <= q_to))
+        return pages if pages else all_pages
+
+    if not all_pages:
+        return []
+
+    # Scanned PDF: estimate which pages cover q_from..q_to
+    q_per_page = max(1, total_q / len(all_pages)) if all_pages else 5
+    page_from = max(0, int((q_from - 1) / q_per_page))
+    page_to   = min(len(all_pages) - 1, int((q_to - 1) / q_per_page))
+    return all_pages[page_from:page_to + 1]
 
 
 def extract_pages(pdf_path: str, page_indices: list, output_path: str):
@@ -200,7 +274,7 @@ def extract_pages(pdf_path: str, page_indices: list, output_path: str):
 def parse_filename(url: str) -> dict:
     filename = url.split("/")[-1].replace(".pdf", "")
     prompt = f"""Parse Singapore exam filename: "{filename}"
-Return ONLY JSON: {{"level":"P6","subject":"Science","year":"2025","exam_type":"WA1","school":"MGS"}}"""
+Return ONLY JSON: {{"level":"P5","subject":"Science","year":"2022","exam_type":"SA2","school":"ACS"}}"""
     try:
         r = requests.post(
             f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}",
@@ -248,16 +322,16 @@ def extract_mentions(update: Update):
     return mentions
 
 
-# ─── HANDLERS ────────────────────────────────────────────────────────
+# ─── TELEGRAM HANDLERS ───────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📚 *Study Session Archive Bot*\n\n"
         "Paste any PDF link and I'll:\n"
-        "• Download it\n"
-        "• Detect MCQ / Open-Ended / Answers sections\n"
-        "• Extract exactly the questions you need\n"
-        "• Track who's printing what\n\n"
-        "You can also tag colleagues: `@alice @bob <link>`\n\n"
+        "• Download + detect sections automatically\n"
+        "• Extract exactly the pages you need\n"
+        "• Works with scanned exam papers too\n\n"
+        "Tag colleagues to track who's printing:\n"
+        "`@alice @bob <pdf link>`\n\n"
         "Commands:\n"
         "`/pending @name` — their open jobs\n"
         "`/done @name` — mark printed\n"
@@ -275,6 +349,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not urls:
         return
 
+    # Check if waiting for custom range input
+    if context.user_data.get("awaiting_custom"):
+        await handle_custom_text(update, context)
+        return
+
     url = urls[0]
     mentions = extract_mentions(update)
     assignee_str = format_assignees(mentions)
@@ -283,7 +362,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"⏳ Downloading...\n👤 For: *{assignee_str}*", parse_mode="Markdown"
     )
 
-    # Download
     try:
         r = requests.get(url, headers={
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
@@ -303,23 +381,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg.edit_text("🔍 Detecting sections...")
     metadata = parse_filename(url)
     metadata["filename"] = filename
-    sections = detect_sections_v2(pdf_path)
+    sections = detect_sections(pdf_path)
 
     context.user_data.update({
         "pdf_path": pdf_path, "sections": sections,
-        "metadata": metadata, "filename": filename,
-        "mentions": mentions,
+        "metadata": metadata, "filename": filename, "mentions": mentions,
     })
 
-    mcq_total = sections.get("mcq_total", len(sections.get("MCQ", [])) * 6)
-    oe_total  = sections.get("oe_total",  len(sections.get("OE",  [])) * 3)
-    ans_pgs   = len(sections.get("Answers", []))
+    mcq_total  = sections.get("mcq_total", 0)
+    oe_total   = sections.get("oe_total", 0)
+    ans_pgs    = len(sections.get("Answers", []))
+    is_scanned = sections.get("is_scanned", False)
+    scan_note  = " _(estimated — scanned PDF)_" if is_scanned else ""
 
-    # Build smart buttons based on actual question counts
-    mcq_half = max(1, mcq_total // 2)
-    oe_half  = max(1, oe_total // 2)
+    mcq_half = max(1, round(mcq_total / 2))
+    oe_half  = max(1, round(oe_total / 2))
 
-    assignee_line = f"\n\n👥 *For:* {assignee_str}" if mentions else ""
+    assignee_line = f"\n👥 *For:* {assignee_str}" if mentions else ""
 
     summary = (
         f"✅ *{filename}*\n"
@@ -327,31 +405,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"| {metadata.get('year')} {metadata.get('exam_type')} — {metadata.get('school')}\n"
         f"📄 {sections['total']} pages total{assignee_line}\n\n"
         f"*Sections detected:*\n"
-        f"• MCQ: {mcq_total} questions ({len(sections.get('MCQ',[]))} pages)\n"
-        f"• Open-ended: {oe_total} questions ({len(sections.get('OE',[]))} pages)\n"
+        f"• MCQ: ~{mcq_total} questions ({len(sections.get('MCQ',[]))} pages){scan_note}\n"
+        f"• Open-ended: ~{oe_total} questions ({len(sections.get('OE',[]))} pages){scan_note}\n"
         f"• Answers: {ans_pgs} pages\n\n"
         f"What do you want to extract?"
     )
 
     keyboard = [
         [
-            InlineKeyboardButton(f"📝 First {mcq_half} MCQ", callback_data=f"ext_mcq_1_{mcq_half}"),
-            InlineKeyboardButton(f"📝 All {mcq_total} MCQ",  callback_data="ext_mcq_all"),
+            InlineKeyboardButton(f"📝 First {mcq_half} MCQ",  callback_data=f"ext_mcq_half"),
+            InlineKeyboardButton(f"📝 All MCQ",                callback_data="ext_mcq_all"),
         ],
         [
-            InlineKeyboardButton(f"📖 First {oe_half} OE",  callback_data=f"ext_oe_1_{oe_half}"),
-            InlineKeyboardButton(f"📖 All {oe_total} OE",   callback_data="ext_oe_all"),
+            InlineKeyboardButton(f"📖 First {oe_half} OE",    callback_data=f"ext_oe_half"),
+            InlineKeyboardButton(f"📖 All OE",                 callback_data="ext_oe_all"),
         ],
         [
-            InlineKeyboardButton("✅ All Answers",           callback_data="ext_answers"),
-            InlineKeyboardButton("📄 Questions only",        callback_data="ext_questions"),
+            InlineKeyboardButton("✅ All Answers",             callback_data="ext_answers"),
+            InlineKeyboardButton("📄 Questions only",          callback_data="ext_questions"),
         ],
         [
-            InlineKeyboardButton("🖨️ All 3 sections separately", callback_data="ext_all_three"),
+            InlineKeyboardButton("🖨️ All 3 separately",       callback_data="ext_all_three"),
         ],
         [
-            InlineKeyboardButton("✏️ Custom range...",       callback_data="ext_custom"),
-            InlineKeyboardButton("📁 Save to Drive & Log",   callback_data="save_log"),
+            InlineKeyboardButton("✏️ Custom range...",         callback_data="ext_custom"),
+            InlineKeyboardButton("📁 Save to Drive & Log",     callback_data="save_log"),
         ],
     ]
 
@@ -370,14 +448,16 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mentions = context.user_data.get("mentions", [])
 
     if not pdf_path or not os.path.exists(pdf_path):
-        await query.edit_message_text("❌ Session expired — please resend the link.")
+        await query.edit_message_text("❌ Session expired — resend the link.")
         return
 
-    tmp_dir = os.path.dirname(pdf_path)
-    mcq_map = sections.get("mcq_q_map", {})
-    oe_map  = sections.get("oe_q_map", {})
+    tmp_dir   = os.path.dirname(pdf_path)
+    mcq_map   = sections.get("mcq_q_map", {})
+    oe_map    = sections.get("oe_q_map", {})
     mcq_total = sections.get("mcq_total", 0)
     oe_total  = sections.get("oe_total", 0)
+    mcq_pages = sections.get("MCQ", [])
+    oe_pages  = sections.get("OE", [])
 
     async def send_pdf(pages, label, tag):
         if not pages:
@@ -389,49 +469,40 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with open(out, "rb") as f:
             await context.bot.send_document(
                 chat_id=query.message.chat_id,
-                document=f,
-                filename=os.path.basename(out),
+                document=f, filename=os.path.basename(out),
                 caption=cap, parse_mode="Markdown"
             )
 
-    await query.edit_message_text("✂️ Extracting — please wait...")
+    await query.edit_message_text("✂️ Extracting...")
 
-    if action.startswith("ext_mcq_") and action != "ext_mcq_all":
-        # ext_mcq_1_15 format
-        parts = action.split("_")
-        q_from, q_to = int(parts[3]), int(parts[4]) if len(parts) > 4 else int(parts[3])
-        if len(parts) == 4:  # ext_mcq_1_N
-            q_from, q_to = 1, int(parts[3])
-        pages = get_pages_for_q_range(mcq_map, q_from, q_to) if mcq_map else sections.get("MCQ", [])[:2]
-        await send_pdf(pages, f"MCQ Q{q_from}–{q_to}", f"MCQ_Q{q_from}-{q_to}")
+    mcq_half = max(1, round(mcq_total / 2))
+    oe_half  = max(1, round(oe_total / 2))
+
+    if action == "ext_mcq_half":
+        pages = get_pages_for_q_range(mcq_map, mcq_pages, 1, mcq_half, mcq_total)
+        await send_pdf(pages, f"MCQ Q1–{mcq_half}", f"MCQ_Q1-{mcq_half}")
 
     elif action == "ext_mcq_all":
-        pages = sections.get("MCQ", [])
-        await send_pdf(pages, f"All MCQ ({mcq_total} questions)", "MCQ_all")
+        await send_pdf(mcq_pages, f"All MCQ (~{mcq_total} questions)", "MCQ_all")
 
-    elif action.startswith("ext_oe_") and action != "ext_oe_all":
-        parts = action.split("_")
-        q_from, q_to = 1, int(parts[3])
-        pages = get_pages_for_q_range(oe_map, q_from, q_to) if oe_map else sections.get("OE", [])[:4]
-        await send_pdf(pages, f"OE Q{q_from}–{q_to}", f"OE_Q{q_from}-{q_to}")
+    elif action == "ext_oe_half":
+        pages = get_pages_for_q_range(oe_map, oe_pages, 1, oe_half, oe_total)
+        await send_pdf(pages, f"OE Q1–{oe_half}", f"OE_Q1-{oe_half}")
 
     elif action == "ext_oe_all":
-        pages = sections.get("OE", [])
-        await send_pdf(pages, f"All OE ({oe_total} questions)", "OE_all")
+        await send_pdf(oe_pages, f"All OE (~{oe_total} questions)", "OE_all")
 
     elif action == "ext_answers":
-        pages = sections.get("Answers", [])
-        await send_pdf(pages, "All Answers", "Answers")
+        await send_pdf(sections.get("Answers", []), "All Answers", "Answers")
 
     elif action == "ext_questions":
-        pages = sections.get("MCQ", []) + sections.get("OE", [])
-        await send_pdf(pages, "Full Questions (no answers)", "Questions_only")
+        await send_pdf(mcq_pages + oe_pages, "Full Questions (no answers)", "Questions_only")
 
     elif action == "ext_all_three":
         for pages, label, tag in [
-            (sections.get("MCQ",[]),     f"All MCQ ({mcq_total}q)", "MCQ_all"),
-            (sections.get("OE",[]),      f"All OE ({oe_total}q)",   "OE_all"),
-            (sections.get("Answers",[]), "All Answers",              "Answers"),
+            (mcq_pages, f"All MCQ (~{mcq_total}q)", "MCQ_all"),
+            (oe_pages,  f"All OE (~{oe_total}q)",   "OE_all"),
+            (sections.get("Answers", []), "Answers", "Answers"),
         ]:
             await send_pdf(pages, label, tag)
 
@@ -439,103 +510,87 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["awaiting_custom"] = True
         await query.edit_message_text(
             "✏️ *Custom extraction*\n\n"
-            "Type what you want, e.g:\n"
-            "• `mcq 1-10`\n"
-            "• `oe 5-12`\n"
-            "• `mcq 11-20`\n"
-            "• `answers`\n"
-            "• `pages 3-7`",
+            "Type what you want:\n"
+            "• `mcq 1-15` — MCQ questions 1 to 15\n"
+            "• `oe 5-10` — OE questions 5 to 10\n"
+            "• `answers` — answer pages\n"
+            "• `pages 3-8` — specific page numbers",
             parse_mode="Markdown"
         )
         return
 
     elif action == "save_log":
         await query.edit_message_text(
-            f"📁 Saved!\n👤 Logged under: {format_assignees(mentions)}\n"
-            f"📊 Check your Google Sheet."
+            f"📁 Saved!\n👤 For: {format_assignees(mentions)}\n📊 Check your Google Sheet."
         )
         return
 
     await query.edit_message_text(
-        f"✅ Done! Sent to chat.\n"
-        f"{'👤 Logged for: ' + format_assignees(mentions) if mentions else ''}"
+        f"✅ Done!\n{'👤 For: ' + format_assignees(mentions) if mentions else 'Sent to chat.'}"
     )
 
 
 async def handle_custom_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle natural language custom extraction requests."""
     if update.effective_user.id != ALLOWED_USER_ID:
         return
 
     text = update.message.text or ""
 
-    # Check for PDF links first
     if re.search(r'https?://\S+\.pdf', text):
+        context.user_data.pop("awaiting_custom", None)
         await handle_message(update, context)
         return
 
-    # Handle custom extraction if we're waiting for it
     if not context.user_data.get("awaiting_custom"):
         return
 
     context.user_data["awaiting_custom"] = False
-    sections = context.user_data.get("sections", {})
-    pdf_path = context.user_data.get("pdf_path")
-    filename = context.user_data.get("filename", "paper.pdf")
+
+    sections  = context.user_data.get("sections", {})
+    pdf_path  = context.user_data.get("pdf_path")
+    filename  = context.user_data.get("filename", "paper.pdf")
+    mentions  = context.user_data.get("mentions", [])
 
     if not pdf_path or not os.path.exists(pdf_path):
         await update.message.reply_text("❌ Session expired — resend the PDF link.")
         return
 
     text_lower = text.lower().strip()
-    tmp_dir = os.path.dirname(pdf_path)
-    mcq_map = sections.get("mcq_q_map", {})
-    oe_map  = sections.get("oe_q_map", {})
+    tmp_dir    = os.path.dirname(pdf_path)
+    mcq_map    = sections.get("mcq_q_map", {})
+    oe_map     = sections.get("oe_q_map", {})
+    mcq_pages  = sections.get("MCQ", [])
+    oe_pages   = sections.get("OE", [])
+    mcq_total  = sections.get("mcq_total", 0)
+    oe_total   = sections.get("oe_total", 0)
 
-    pages = []
-    label = text
+    pages, label = [], text
 
-    # Parse: "mcq 1-10", "oe 5-12", "mcq 11 to 20", "answers", "pages 3-7"
-    mcq_match = re.search(r'mcq\s+(\d+)[\s\-to]+(\d+)', text_lower)
-    oe_match  = re.search(r'oe\s+(\d+)[\s\-to]+(\d+)', text_lower)
-    pg_match  = re.search(r'pages?\s+(\d+)[\s\-to]+(\d+)', text_lower)
+    mcq_m = re.search(r'mcq\s+(\d+)\s*[-–to]+\s*(\d+)', text_lower)
+    oe_m  = re.search(r'oe\s+(\d+)\s*[-–to]+\s*(\d+)',  text_lower)
+    pg_m  = re.search(r'pages?\s+(\d+)\s*[-–to]+\s*(\d+)', text_lower)
 
-    if mcq_match:
-        q1, q2 = int(mcq_match.group(1)), int(mcq_match.group(2))
-        pages = get_pages_for_q_range(mcq_map, q1, q2) if mcq_map else sections.get("MCQ", [])
+    if mcq_m:
+        q1, q2 = int(mcq_m.group(1)), int(mcq_m.group(2))
+        pages = get_pages_for_q_range(mcq_map, mcq_pages, q1, q2, mcq_total)
         label = f"MCQ Q{q1}–{q2}"
-    elif oe_match:
-        q1, q2 = int(oe_match.group(1)), int(oe_match.group(2))
-        pages = get_pages_for_q_range(oe_map, q1, q2) if oe_map else sections.get("OE", [])
+    elif oe_m:
+        q1, q2 = int(oe_m.group(1)), int(oe_m.group(2))
+        pages = get_pages_for_q_range(oe_map, oe_pages, q1, q2, oe_total)
         label = f"OE Q{q1}–{q2}"
-    elif pg_match:
-        p1, p2 = int(pg_match.group(1))-1, int(pg_match.group(2))-1
-        pages = list(range(p1, p2+1))
+    elif pg_m:
+        p1, p2 = int(pg_m.group(1)) - 1, int(pg_m.group(2)) - 1
+        pages = list(range(p1, p2 + 1))
         label = f"Pages {p1+1}–{p2+1}"
     elif "answer" in text_lower:
         pages = sections.get("Answers", [])
         label = "Answers"
     else:
-        # Ask Gemini to parse it
-        prompt = f"""Parse this extraction request for a Singapore exam paper:
-"{text}"
-MCQ question map: {mcq_map}
-OE question map: {oe_map}
-Return ONLY JSON: {{"pages": [0,1,2], "label": "MCQ Q1-10"}}"""
-        try:
-            r = requests.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}",
-                json={"contents": [{"parts": [{"text": prompt}]}]}, timeout=15
-            )
-            result = r.json()["candidates"][0]["content"]["parts"][0]["text"]
-            m = re.search(r'\{.*\}', result, re.DOTALL)
-            if m:
-                parsed = json.loads(m.group())
-                pages = parsed.get("pages", [])
-                label = parsed.get("label", text)
-        except:
-            await update.message.reply_text("❌ Couldn't parse that. Try: `mcq 1-10` or `oe 5-12`", parse_mode="Markdown")
-            return
+        await update.message.reply_text(
+            "❓ Couldn't parse that. Try:\n`mcq 1-15` · `oe 5-10` · `pages 3-8` · `answers`",
+            parse_mode="Markdown"
+        )
+        return
 
     if not pages:
         await update.message.reply_text("⚠️ No pages found for that range.")
@@ -548,7 +603,7 @@ Return ONLY JSON: {{"pages": [0,1,2], "label": "MCQ Q1-10"}}"""
     with open(out_path, "rb") as f:
         await update.message.reply_document(
             document=f, filename=out_name,
-            caption=f"📄 *{label}* — {len(pages)} page(s)",
+            caption=f"📄 *{label}* — {len(pages)} page(s) · For: {format_assignees(mentions)}",
             parse_mode="Markdown"
         )
 
@@ -556,7 +611,7 @@ Return ONLY JSON: {{"pages": [0,1,2], "label": "MCQ Q1-10"}}"""
 async def cmd_pending(update, context):
     args = context.args
     name = args[0].lstrip("@") if args else "?"
-    await update.message.reply_text(f"📋 Pending jobs for @{name}: *(connect Google Sheets to see live data)*", parse_mode="Markdown")
+    await update.message.reply_text(f"📋 Pending for @{name}: _(connect Google Sheets to see live data)_", parse_mode="Markdown")
 
 async def cmd_done(update, context):
     args = context.args
@@ -564,10 +619,9 @@ async def cmd_done(update, context):
     await update.message.reply_text(f"✅ Marked @{name}'s jobs as printed.", parse_mode="Markdown")
 
 async def cmd_summary(update, context):
-    await update.message.reply_text("📊 *(connect Google Sheets to see live summary)*", parse_mode="Markdown")
+    await update.message.reply_text("📊 _(connect Google Sheets to see live summary)_", parse_mode="Markdown")
 
 
-# ─── MAIN ────────────────────────────────────────────────────────────
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start",   start))
@@ -576,7 +630,7 @@ def main():
     app.add_handler(CommandHandler("summary", cmd_summary))
     app.add_handler(CallbackQueryHandler(handle_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_custom_text))
-    logger.info("Archive Bot v3 started!")
+    logger.info("Archive Bot v4 started!")
     app.run_polling()
 
 if __name__ == "__main__":
